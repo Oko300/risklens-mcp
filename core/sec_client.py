@@ -80,21 +80,30 @@ def _get_user_agent() -> str:
     return ua
 
 
-def _headers() -> dict[str, str]:
+def _headers(host: str = "data.sec.gov") -> dict[str, str]:
     return {
         "User-Agent": _get_user_agent(),
         "Accept-Encoding": "gzip, deflate",
-        "Host": "data.sec.gov",
+        "Host": host,
     }
+
+
+def _host_for_url(url: str) -> str:
+    """Extract the hostname from a URL so the Host header always matches
+    where the request is actually going (data.sec.gov vs www.sec.gov)."""
+    # Minimal, dependency-free host extraction: strip scheme, take up to next '/'.
+    no_scheme = url.split("://", 1)[-1]
+    return no_scheme.split("/", 1)[0]
 
 
 async def _get_json(client: httpx.AsyncClient, url: str, *, max_retries: int = 3) -> Any:
     """GET a URL and parse JSON, with rate limiting + retry on 429/5xx."""
     last_exc: Optional[Exception] = None
+    headers = _headers(host=_host_for_url(url))
     for attempt in range(1, max_retries + 1):
         await _rate_limiter.wait()
         try:
-            resp = await client.get(url, headers=_headers(), timeout=_REQUEST_TIMEOUT)
+            resp = await client.get(url, headers=headers, timeout=_REQUEST_TIMEOUT)
             if resp.status_code == 429:
                 wait_s = 1.5 * attempt
                 logger.warning("SEC EDGAR rate-limited us (429) on %s — backing off %.1fs", url, wait_s)
@@ -114,11 +123,10 @@ async def _get_json(client: httpx.AsyncClient, url: str, *, max_retries: int = 3
 async def _get_text(client: httpx.AsyncClient, url: str, *, max_retries: int = 3) -> Optional[str]:
     """GET a URL and return raw text (used for Form 4 XML), with the same retry policy."""
     last_exc: Optional[Exception] = None
+    headers = _headers(host=_host_for_url(url))
     for attempt in range(1, max_retries + 1):
         await _rate_limiter.wait()
         try:
-            headers = _headers()
-            headers["Host"] = "www.sec.gov"
             resp = await client.get(url, headers=headers, timeout=_REQUEST_TIMEOUT)
             if resp.status_code == 429:
                 wait_s = 1.5 * attempt
@@ -150,8 +158,7 @@ async def resolve_ticker_to_cik(ticker: str) -> Optional[dict[str, str]]:
     async with _ticker_map_lock:
         if _ticker_map_cache is None:
             async with httpx.AsyncClient() as client:
-                headers = _headers()
-                headers["Host"] = "www.sec.gov"
+                headers = _headers(host=_host_for_url(TICKER_MAP_URL))
                 await _rate_limiter.wait()
                 resp = await client.get(TICKER_MAP_URL, headers=headers, timeout=_REQUEST_TIMEOUT)
                 resp.raise_for_status()
