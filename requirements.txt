@@ -1,0 +1,16 @@
+# RiskLens MCP — pinned dependencies (tested combination)
+
+# MCP server framework (FastMCP), streamable-http transport
+mcp[cli]==1.28.0
+
+# Upstash Redis REST client (async)
+upstash-redis==1.7.0
+
+# Async HTTP client for SEC EDGAR
+httpx==0.28.1
+
+# .env file loading
+python-dotenv==1.2.2
+
+# Used internally by mcp/FastMCP for schema validation
+pydantic==2.13.4
