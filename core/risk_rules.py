@@ -126,3 +126,147 @@ def score_to_risk_level(score: float) -> str:
     if score >= 2.5:
         return "MODERATE"
     return "LOW"
+
+
+# ---------------------------------------------------------------------------
+# Clustering detection — context-aware risk signals that a single item code
+# can't capture on its own. A single 5.02 (officer departure) is routine;
+# three of them in 60 days is a pattern worth flagging explicitly, with the
+# reason stated plainly rather than buried in a generic risk_score.
+# ---------------------------------------------------------------------------
+
+from datetime import datetime  # noqa: E402
+
+# (item_code, cluster_window_days, min_occurrences, escalated_label, bump)
+CLUSTER_RULES: list[dict[str, object]] = [
+    {
+        "item_codes": {"5.02"},
+        "window_days": 60,
+        "min_count": 2,
+        "reason_template": "{count} executive/director departure filings (Item 5.02) within {window} days",
+        "score_bump": 2.5,
+    },
+    {
+        "item_codes": {"5.02"},
+        "window_days": 30,
+        "min_count": 3,
+        "reason_template": "{count} executive/director departure filings (Item 5.02) within {window} days — rapid leadership turnover",
+        "score_bump": 4.0,
+    },
+    {
+        "item_codes": {"4.01"},
+        "window_days": 365,
+        "min_count": 2,
+        "reason_template": "{count} auditor changes (Item 4.01) within {window} days — unusual audit-relationship instability",
+        "score_bump": 3.0,
+    },
+    {
+        "item_codes": {"2.04"},
+        "window_days": 180,
+        "min_count": 2,
+        "reason_template": "{count} debt-acceleration triggering events (Item 2.04) within {window} days",
+        "score_bump": 3.0,
+    },
+    {
+        "item_codes": {"8.01"},
+        "window_days": 30,
+        "min_count": 4,
+        "reason_template": "{count} 'Other Events' filings (Item 8.01) within {window} days — unusually high disclosure cadence worth a closer look",
+        "score_bump": 1.5,
+    },
+    {
+        "item_codes": {"1.02", "2.04", "2.05", "2.06", "3.01"},
+        "window_days": 180,
+        "min_count": 2,
+        "reason_template": "{count} distinct financial-distress-pattern filings (contract terminations, accelerated debt, impairments, or delisting notices) within {window} days",
+        "score_bump": 4.0,
+    },
+]
+
+
+def detect_clusters(filings: list[dict[str, object]]) -> list[dict[str, object]]:
+    """
+    Scan a list of filings (each with "filing_date": "YYYY-MM-DD" and
+    "item_codes": list[str]) for clustering patterns defined in CLUSTER_RULES.
+
+    Returns a list of triggered clusters:
+        [{"reason": str, "score_bump": float, "item_codes": [...], "matched_dates": [...]}]
+
+    This is what turns "two 5.02 filings, neither individually severe" into
+    an explicit, explainable HIGH-risk reason instead of staying invisible
+    inside a flat sum-of-weights score.
+
+    Rules targeting the SAME item-code set are mutually exclusive — only the
+    single strongest (highest score_bump) matching rule per item-code-set
+    fires. This prevents a tighter/stronger pattern (e.g. 3 filings in 30
+    days) from stacking its bump on top of a looser version of the same
+    pattern (e.g. 2 filings in 60 days), which would double-count one
+    underlying fact pattern as two separate risk signals.
+    """
+    parsed: list[tuple] = []
+    for f in filings:
+        try:
+            d = datetime.strptime(str(f["filing_date"]), "%Y-%m-%d").date()
+        except (ValueError, KeyError, TypeError):
+            continue
+        codes = set(f.get("item_codes", []))
+        parsed.append((d, codes))
+
+    # Group rules by their target item-code set so we can pick only the
+    # strongest match within each group.
+    candidates_by_group: dict[frozenset, list[dict[str, object]]] = {}
+
+    for rule in CLUSTER_RULES:
+        target_codes = rule["item_codes"]
+        window = int(rule["window_days"])
+        min_count = int(rule["min_count"])
+
+        matches = [(d, codes & target_codes) for d, codes in parsed if codes & target_codes]
+        if len(matches) < min_count:
+            continue
+
+        matches.sort(key=lambda x: x[0])
+        for i in range(len(matches) - min_count + 1):
+            window_slice = matches[i : i + min_count]
+            span = (window_slice[-1][0] - window_slice[0][0]).days
+            if span <= window:
+                matched_dates = [d.isoformat() for d, _ in window_slice]
+                matched_codes = sorted({c for _, codes in window_slice for c in codes})
+                group_key = frozenset(target_codes)
+                candidates_by_group.setdefault(group_key, []).append(
+                    {
+                        "reason": rule["reason_template"].format(count=len(window_slice), window=window),
+                        "score_bump": float(rule["score_bump"]),
+                        "item_codes": matched_codes,
+                        "matched_dates": matched_dates,
+                    }
+                )
+                break  # one trigger per rule is enough; avoid double-counting overlapping windows within the same rule
+
+    # Keep only the strongest (highest score_bump) candidate per group.
+    triggered = []
+    for group_key, candidates in candidates_by_group.items():
+        best = max(candidates, key=lambda c: c["score_bump"])
+        triggered.append(best)
+
+    return triggered
+
+
+def risk_tier_with_reason(score: float, cluster_reasons: list[str], severe_labels: list[str]) -> dict[str, str]:
+    """
+    Produce a tier + a single, concrete, human-readable reason string —
+    e.g. "HIGH - Multiple key executive departures in 30 days" — instead of
+    a bare LOW/MODERATE/ELEVATED/SEVERE label with no explanation.
+    """
+    level = score_to_risk_level(score)
+
+    if severe_labels:
+        reason = severe_labels[0]
+    elif cluster_reasons:
+        reason = cluster_reasons[0]
+    elif score > 0:
+        reason = "Elevated-risk disclosure category present, but isolated (no clustering or severe pattern detected)"
+    else:
+        reason = "No risk-flagged disclosure categories in this window"
+
+    return {"level": level, "reason": reason, "tier_label": f"{level} - {reason}"}

@@ -14,3 +14,7 @@ python-dotenv==1.2.2
 
 # Used internally by mcp/FastMCP for schema validation
 pydantic==2.13.4
+
+# HTML parsing for extracting real filing body text (core/filing_content.py)
+beautifulsoup4==4.15.0
+lxml==6.1.1

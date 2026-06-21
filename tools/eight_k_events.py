@@ -8,27 +8,47 @@ disclosed item codes for risk signal: restatements, bankruptcy/receivership,
 delisting notices, accelerated debt obligations, impairments, leadership
 upheaval, and so on.
 
+Every filing in the response carries real, extracted DETAIL — actual text
+pulled from the filing's own document, not just an item-code label — so a
+reader (human or LLM) sees what was actually disclosed first. The risk
+read (score, tier, narrative) is layered on top of that real content, not
+a substitute for it. Flagged/high-risk filings additionally get the
+complete per-item section text, since that's where a deeper read is worth
+the extra document fetch; routine filings get a short excerpt and stay fast.
+
+This tool also looks for CLUSTERING patterns across filings (e.g. multiple
+director departures in a short window) that are easy to miss when scoring
+each filing in isolation — turning "two 5.02 filings, neither individually
+severe" into an explicit, explainable risk reason instead of staying
+invisible inside a flat score.
+
 Flexible by design: the same tool can return a neutral/plain summary of
 recent 8-K activity (mode="summary") for people who just want "what has
-this company filed lately", while the default mode="risk" leads with the
-risk read.
+this company filed lately" — still with real per-filing detail, just
+without risk scoring/flagging language — while the default mode="risk"
+leads with the risk read.
 
-Caching: keyed on (ticker, lookback_days, mode). Cache is checked first;
-on a hit we return immediately without touching SEC EDGAR at all.
+Caching: keyed on (ticker, lookback_days, mode, include_excerpts). Cache is
+checked first; on a hit we return immediately without touching SEC EDGAR
+or re-fetching/re-parsing any filing documents.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 
 from core.cache import build_cache_key, get_cached, set_cached
+from core.filing_content import build_excerpt, fetch_item_sections
 from core.risk_rules import (
     EIGHT_K_ITEMS,
     HIGH_RISK_8K_ITEMS,
     SEVERE_RISK_8K_ITEMS,
     classify_8k_item,
+    detect_clusters,
+    risk_tier_with_reason,
     score_to_risk_level,
 )
 from core.sec_client import fetch_submissions, resolve_ticker_to_cik
@@ -37,11 +57,24 @@ logger = logging.getLogger("risklens.tools.eight_k")
 
 TOOL_NAME = "8k_events"
 
+# Full per-item section text is only fetched for the highest-priority
+# flagged filings (weight >= 2 or part of a detected cluster) — this keeps
+# routine calls fast, per the deliberate latency/depth tradeoff for this tool.
+MAX_FILINGS_FOR_FULL_TEXT = 5
+
+# Every filing in the response gets a short `details` excerpt regardless of
+# risk level, so the reader has real content to look at — not just an item
+# code — even for routine filings. Capped separately from full-text fetches
+# so a company with many filings in the lookback window doesn't trigger an
+# unbounded number of document fetches on a single call.
+MAX_FILINGS_FOR_DETAILS = 15
+
 
 async def analyze_8k_events(
     ticker: str,
     lookback_days: int = 180,
     mode: Literal["risk", "summary"] = "risk",
+    include_excerpts: bool = True,
 ) -> dict[str, Any]:
     """
     Analyze a company's recent 8-K filings on SEC EDGAR.
@@ -51,11 +84,20 @@ async def analyze_8k_events(
         lookback_days: How many days back to look for 8-K filings. Default 180.
             Clamped to the range [1, 1825] (5 years) to keep responses sane.
         mode: "risk" (default) returns a risk-focused analysis: severity
-            scoring, flagged items, and a plain-language risk narrative.
-            "summary" returns a neutral, non-judgmental list of recent
-            8-K filings and what each one disclosed, with no risk framing —
-            useful when someone just wants to know what a company has
-            filed lately.
+            scoring, clustering detection, real per-filing detail excerpts,
+            full text on the highest-priority flagged filings, and a
+            plain-language risk narrative with a concrete reason. "summary"
+            returns a neutral, non-judgmental list of recent 8-K filings —
+            still with real per-filing detail excerpts — and no risk framing,
+            useful when someone just wants to know what a company has filed
+            lately.
+        include_excerpts: When True (default), fetches each filing's actual
+            document and returns a real, extracted "details" excerpt per
+            disclosed item (not just the item code) on every filing, plus
+            full per-item section text on the highest-priority flagged
+            filings in risk mode. Set False to skip document fetches
+            entirely and get a faster, metadata-only response (item codes
+            and labels only, no real filing text).
 
     Returns:
         A dict with the analysis. Always includes "from_cache": bool so
@@ -64,24 +106,23 @@ async def analyze_8k_events(
     lookback_days = max(1, min(int(lookback_days), 1825))
     ticker_clean = ticker.strip().upper()
 
-    cache_key = build_cache_key(TOOL_NAME, ticker=ticker_clean, lookback_days=lookback_days, mode=mode)
+    cache_key = build_cache_key(
+        TOOL_NAME, ticker=ticker_clean, lookback_days=lookback_days, mode=mode, include_excerpts=include_excerpts
+    )
 
     cached = await get_cached(cache_key)
     if cached is not None:
         return {**cached, "from_cache": True}
 
-    result = await _run_analysis(ticker_clean, lookback_days, mode)
+    result = await _run_analysis(ticker_clean, lookback_days, mode, include_excerpts)
 
-    # Only cache successful analyses — never cache error responses, so a
-    # transient SEC EDGAR failure doesn't get "stuck" in the cache for
-    # 3 days.
     if not result.get("error"):
         await set_cached(cache_key, result)
 
     return {**result, "from_cache": False}
 
 
-async def _run_analysis(ticker: str, lookback_days: int, mode: str) -> dict[str, Any]:
+async def _run_analysis(ticker: str, lookback_days: int, mode: str, include_excerpts: bool) -> dict[str, Any]:
     company = await resolve_ticker_to_cik(ticker)
     if company is None:
         return {
@@ -108,15 +149,11 @@ async def _run_analysis(ticker: str, lookback_days: int, mode: str) -> dict[str,
     filings = _extract_8k_filings(submissions, cik, lookback_days)
 
     if mode == "summary":
-        return _build_summary_response(ticker, company, cik, lookback_days, filings)
-    return _build_risk_response(ticker, company, cik, lookback_days, filings)
+        return await _build_summary_response(ticker, company, cik, lookback_days, filings, include_excerpts)
+    return await _build_risk_response(ticker, company, cik, lookback_days, filings, include_excerpts)
 
 
 def _extract_8k_filings(submissions: dict[str, Any], cik: str, lookback_days: int) -> list[dict[str, Any]]:
-    """
-    Pull 8-K (and 8-K/A) filings out of the EDGAR submissions JSON, within
-    the lookback window, returning them newest-first with parsed item codes.
-    """
     recent = submissions.get("filings", {}).get("recent", {})
     forms = recent.get("form", [])
     dates = recent.get("filingDate", [])
@@ -168,13 +205,36 @@ def _filing_url(cik: str, accession_number: Optional[str]) -> Optional[str]:
     return f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{accession_number}-index.htm"
 
 
-def _build_summary_response(
-    ticker: str, company: dict[str, str], cik: str, lookback_days: int, filings: list[dict[str, Any]]
+async def _build_summary_response(
+    ticker: str,
+    company: dict[str, str],
+    cik: str,
+    lookback_days: int,
+    filings: list[dict[str, Any]],
+    include_excerpts: bool,
 ) -> dict[str, Any]:
-    """Neutral, non-judgmental view: what was filed, plainly described."""
+    if include_excerpts:
+        detail_targets = filings[:MAX_FILINGS_FOR_DETAILS]
+        section_results = await asyncio.gather(
+            *[
+                fetch_item_sections(cik, f["accession_number"], f.get("primary_document"))
+                for f in detail_targets
+            ],
+            return_exceptions=True,
+        )
+        content_by_accession: dict[str, dict[str, str]] = {}
+        for f, sections in zip(detail_targets, section_results):
+            if isinstance(sections, Exception):
+                logger.warning("Content fetch failed for accession=%s: %s", f.get("accession_number"), sections)
+                sections = {}
+            content_by_accession[f["accession_number"]] = sections
+    else:
+        content_by_accession = {}
+
     plain_filings = []
     for f in filings:
         item_labels = [d["label"] for d in f["items_detail"]]
+        sections = content_by_accession.get(f["accession_number"], {})
         plain_filings.append(
             {
                 "filing_date": f["filing_date"],
@@ -182,6 +242,7 @@ def _build_summary_response(
                 "items": f["item_codes"],
                 "item_labels": item_labels,
                 "filing_url": f["filing_url"],
+                "details": {code: build_excerpt(text) for code, text in sections.items()},
             }
         )
 
@@ -204,10 +265,16 @@ def _build_summary_response(
     }
 
 
-def _build_risk_response(
-    ticker: str, company: dict[str, str], cik: str, lookback_days: int, filings: list[dict[str, Any]]
+async def _build_risk_response(
+    ticker: str,
+    company: dict[str, str],
+    cik: str,
+    lookback_days: int,
+    filings: list[dict[str, Any]],
+    include_excerpts: bool,
 ) -> dict[str, Any]:
-    """Risk-focused view: severity scoring, flagged events, narrative."""
+    company_name = company.get("name") or ticker
+
     all_item_hits: list[dict[str, Any]] = []
     for f in filings:
         for detail in f["items_detail"]:
@@ -216,46 +283,98 @@ def _build_risk_response(
     high_risk_hits = [h for h in all_item_hits if h["code"] in HIGH_RISK_8K_ITEMS]
     severe_hits = [h for h in all_item_hits if h["code"] in SEVERE_RISK_8K_ITEMS]
 
-    # Score model: anchored on the single worst item found (so one severe
-    # disclosure, e.g. a restatement, is never diluted into a moderate
-    # score just because most of a company's other filings are routine),
-    # plus a smaller "breadth" term so repeated/clustered risk items still
-    # push the score higher than a single isolated one.
-    #
-    # weight 3 (severe) item alone   -> floor of 7.5 (SEVERE band)
-    # weight 2 (elevated) item alone -> floor of 5.0 (ELEVATED band)
-    # weight 1 (mild) item alone     -> floor of 2.0 (MODERATE-ish, not LOW)
-    # weight 0 items contribute nothing to the floor.
     weight_to_floor = {3: 7.5, 2: 5.0, 1: 2.0, 0: 0.0}
     max_weight = max((int(h["weight"]) for h in all_item_hits), default=0)
     severity_floor = weight_to_floor.get(max_weight, 0.0)
-
-    # Extra contribution from additional risk-bearing items beyond the
-    # single worst one (so repeated/clustered severe events score higher
-    # than one isolated severe event, without diluting a single event
-    # below its proper severity floor).
     extra_weight = sum(float(h["weight"]) for h in all_item_hits) - max_weight
     breadth_bonus = min(2.5, extra_weight * 0.5)
+    base_score = severity_floor + breadth_bonus if all_item_hits else 0.0
 
-    normalized_score = min(10.0, severity_floor + breadth_bonus) if all_item_hits else 0.0
+    clusters = detect_clusters(filings)
+    cluster_bump = sum(c["score_bump"] for c in clusters)
+
+    normalized_score = min(10.0, base_score + cluster_bump)
     risk_level = score_to_risk_level(normalized_score)
+
+    severe_labels = sorted({h["label"] for h in severe_hits})
+    cluster_reasons = [c["reason"] for c in clusters]
+    tier = risk_tier_with_reason(normalized_score, cluster_reasons, severe_labels)
 
     category_counts: dict[str, int] = {}
     for h in all_item_hits:
         category_counts[h["category"]] = category_counts.get(h["category"], 0) + 1
 
     flagged_filings = [
-        {
-            "filing_date": f["filing_date"],
-            "items": [d["code"] for d in f["items_detail"] if d["weight"] >= 2],
-            "item_labels": [d["label"] for d in f["items_detail"] if d["weight"] >= 2],
-            "filing_url": f["filing_url"],
-        }
+        f
         for f in filings
         if any(d["weight"] >= 2 for d in f["items_detail"])
+        or any(f["filing_date"] in c.get("matched_dates", []) for c in clusters)
     ]
 
-    narrative = _risk_narrative(company.get("name") or ticker, lookback_days, filings, severe_hits, high_risk_hits, risk_level)
+    # Two-tier content fetch:
+    #   1. DETAILS: every filing (up to MAX_FILINGS_FOR_DETAILS) gets a short,
+    #      real excerpt pulled from its actual document text — not just the
+    #      item-code label — so the reader sees what happened before the
+    #      risk read, per the product's "filings with detail first, risk
+    #      layered on top" design.
+    #   2. FULL TEXT: only flagged/high-risk filings (or those caught in a
+    #      detected cluster) additionally get the complete per-item section
+    #      text, since that's where deeper read is actually worth the extra
+    #      fetch — routine filings stay fast.
+    if include_excerpts:
+        detail_targets = filings[:MAX_FILINGS_FOR_DETAILS]
+        full_text_accessions = {f["accession_number"] for f in flagged_filings[:MAX_FILINGS_FOR_FULL_TEXT]}
+
+        section_results = await asyncio.gather(
+            *[
+                fetch_item_sections(cik, f["accession_number"], f.get("primary_document"))
+                for f in detail_targets
+            ],
+            return_exceptions=True,
+        )
+
+        filing_content_by_accession: dict[str, dict[str, str]] = {}
+        for f, sections in zip(detail_targets, section_results):
+            if isinstance(sections, Exception):
+                logger.warning("Content fetch failed for accession=%s: %s", f.get("accession_number"), sections)
+                sections = {}
+            filing_content_by_accession[f["accession_number"]] = sections
+    else:
+        filing_content_by_accession = {}
+        full_text_accessions = set()
+
+    def _filing_details(f: dict[str, Any]) -> dict[str, Any]:
+        sections = filing_content_by_accession.get(f["accession_number"], {})
+        item_excerpts = {code: build_excerpt(text) for code, text in sections.items()}
+        full_text = (
+            {code: text for code, text in sections.items()}
+            if f["accession_number"] in full_text_accessions
+            else {}
+        )
+        return {
+            "item_excerpts": item_excerpts,  # short, ~110-word excerpt per disclosed item, real text from the filing
+            "item_full_text": full_text,  # complete section text, only populated for flagged filings
+            "content_available": bool(sections),
+        }
+
+    excerpted_filings: list[dict[str, Any]] = []
+    if include_excerpts:
+        for f in flagged_filings[:MAX_FILINGS_FOR_FULL_TEXT]:
+            details = _filing_details(f)
+            excerpted_filings.append(
+                {
+                    "filing_date": f["filing_date"],
+                    "items": f["item_codes"],
+                    "item_labels": [d["label"] for d in f["items_detail"]],
+                    "filing_url": f["filing_url"],
+                    "item_full_text": details["item_full_text"],
+                    "content_available": details["content_available"],
+                }
+            )
+
+    narrative = _risk_narrative(
+        company_name, lookback_days, filings, severe_hits, high_risk_hits, clusters, tier
+    )
 
     return {
         "error": False,
@@ -267,25 +386,39 @@ def _build_risk_response(
         "filing_count": len(filings),
         "risk_score": round(normalized_score, 1),
         "risk_level": risk_level,
+        "risk_tier_label": tier["tier_label"],
+        "risk_reason": tier["reason"],
         "severe_event_count": len(severe_hits),
         "high_risk_event_count": len(high_risk_hits),
         "risk_category_breakdown": category_counts,
-        "flagged_filings": flagged_filings,
+        "clusters_detected": clusters,
+        "flagged_filings": [
+            {
+                "filing_date": f["filing_date"],
+                "items": [d["code"] for d in f["items_detail"] if d["weight"] >= 2],
+                "item_labels": [d["label"] for d in f["items_detail"] if d["weight"] >= 2],
+                "filing_url": f["filing_url"],
+            }
+            for f in flagged_filings
+        ],
+        "flagged_filings_full_text": excerpted_filings,
         "all_filings": [
             {
                 "filing_date": f["filing_date"],
                 "items": f["item_codes"],
                 "item_labels": [d["label"] for d in f["items_detail"]],
                 "filing_url": f["filing_url"],
+                "details": _filing_details(f)["item_excerpts"],
             }
             for f in filings
         ],
         "narrative": narrative,
         "disclaimer": (
-            "This analysis is derived solely from SEC EDGAR item codes and is "
-            "not investment advice. It highlights disclosure patterns conventionally "
-            "associated with elevated risk; it does not assess whether the underlying "
-            "events were ultimately material, resolved, or financially significant."
+            "This analysis is derived from SEC EDGAR item codes, clustering patterns across "
+            "filings, and real extracted text from the underlying filing documents. It is not "
+            "investment advice. The 'details' and 'item_full_text' fields are verbatim excerpts "
+            "from the filer's own disclosure (not commentary or interpretation) — read them in "
+            "context via the filing_url before drawing conclusions."
         ),
     }
 
@@ -296,7 +429,8 @@ def _risk_narrative(
     filings: list[dict[str, Any]],
     severe_hits: list[dict[str, Any]],
     high_risk_hits: list[dict[str, Any]],
-    risk_level: str,
+    clusters: list[dict[str, Any]],
+    tier: dict[str, str],
 ) -> str:
     if not filings:
         return (
@@ -304,27 +438,32 @@ def _risk_narrative(
             "No 8-K-driven risk signal to assess for this window."
         )
 
+    parts = [f"{company_name}'s 8-K filings over the last {lookback_days} days: {tier['tier_label']}."]
+
     if severe_hits:
         labels = sorted({h["label"] for h in severe_hits})
-        return (
-            f"{company_name}'s 8-K filings over the last {lookback_days} days show "
-            f"{risk_level} risk signal. {len(severe_hits)} severe-category disclosure(s) "
-            f"were found, including: {'; '.join(labels[:4])}. These are the categories "
-            "SEC filers most often use for events like restatements, bankruptcy, "
-            "delisting, or accelerated debt obligations — worth direct follow-up."
+        parts.append(
+            f"{len(severe_hits)} severe-category disclosure(s) found, including: "
+            f"{'; '.join(labels[:4])}. These categories are the ones SEC filers use for events "
+            "like restatements, bankruptcy, delisting, or accelerated debt obligations — worth "
+            "direct follow-up via the filing text itself."
         )
-
-    if high_risk_hits:
+    elif high_risk_hits:
         labels = sorted({h["label"] for h in high_risk_hits})
-        return (
-            f"{company_name}'s 8-K filings over the last {lookback_days} days show "
-            f"{risk_level} risk signal, driven by {len(high_risk_hits)} elevated-risk "
-            f"disclosure(s): {'; '.join(labels[:4])}. No severe-category items (e.g. "
-            "bankruptcy, restatement, delisting) were found in this window."
+        parts.append(
+            f"{len(high_risk_hits)} elevated-risk disclosure(s): {'; '.join(labels[:4])}. "
+            "No severe-category items (e.g. bankruptcy, restatement, delisting) were found "
+            "in this window."
         )
 
-    return (
-        f"{company_name} filed {len(filings)} Form 8-K report(s) in the last "
-        f"{lookback_days} days, all in routine or low-risk categories (e.g. earnings "
-        f"releases, exhibits, governance housekeeping). Risk level: {risk_level}."
-    )
+    if clusters:
+        for c in clusters[:3]:
+            parts.append(f"Pattern detected: {c['reason']}.")
+    elif not severe_hits and not high_risk_hits:
+        parts.append(
+            f"All {len(filings)} filing(s) fall into routine or low-risk categories "
+            "(e.g. earnings releases, exhibits, governance housekeeping), and no clustering "
+            "patterns were detected across the filing history in this window."
+        )
+
+    return " ".join(parts)

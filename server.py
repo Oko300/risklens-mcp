@@ -103,27 +103,37 @@ mcp = FastMCP(
     name="analyze_8k_events",
     description=(
         "Analyze a company's recent SEC Form 8-K filings for risk signal. "
-        "Surfaces and scores high-risk disclosure categories (restatements, "
-        "bankruptcy/receivership, delisting notices, accelerated debt obligations, "
-        "impairments, leadership departures, auditor changes) drawn from the "
-        "filing's official item codes. Pass mode='summary' for a neutral list "
-        "of recent 8-K filings without risk framing. Works for any US public "
-        "company that files with the SEC."
+        "Returns real, extracted detail from each filing's actual document text "
+        "(not just item-code labels), plus clustering detection across filings "
+        "(e.g. multiple leadership departures in a short window), severity "
+        "scoring, and a plain-language risk reason. Surfaces high-risk disclosure "
+        "categories (restatements, bankruptcy/receivership, delisting notices, "
+        "accelerated debt obligations, impairments, leadership departures, "
+        "auditor changes). Pass mode='summary' for a neutral list of recent 8-K "
+        "filings (still with real per-filing detail) without risk framing. Works "
+        "for any US public company that files with the SEC."
     ),
 )
 async def analyze_8k_events(
     ticker: str,
     lookback_days: int = 180,
     mode: str = "risk",
+    include_excerpts: bool = True,
 ) -> dict:
     """
     Args:
         ticker: Stock ticker symbol (e.g. "AAPL", "TSLA", "GME").
         lookback_days: How many days back to search (default 180, max 1825).
         mode: "risk" (default, risk-scored analysis) or "summary" (neutral filing list).
+        include_excerpts: When True (default), fetches each filing's actual
+            document and returns real extracted text per disclosed item, plus
+            full section text on the highest-priority flagged filings. Set
+            False for a faster, metadata-only response (item codes/labels only).
     """
     mode_normalized = mode if mode in ("risk", "summary") else "risk"
-    return await _analyze_8k_events(ticker=ticker, lookback_days=lookback_days, mode=mode_normalized)
+    return await _analyze_8k_events(
+        ticker=ticker, lookback_days=lookback_days, mode=mode_normalized, include_excerpts=include_excerpts
+    )
 
 
 @mcp.tool(

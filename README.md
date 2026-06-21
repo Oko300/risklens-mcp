@@ -2,7 +2,7 @@
 
 A focused, production-ready **MCP (Model Context Protocol) server** exposing exactly two tools for risk analysis of US public companies, built on live SEC EDGAR data:
 
-1. **`analyze_8k_events`** — risk analysis of a company's recent Form 8-K filings (restatements, bankruptcy, delisting, accelerated debt, impairments, leadership changes, and more)
+1. **`analyze_8k_events`** — risk analysis of a company's recent Form 8-K filings (restatements, bankruptcy, delisting, accelerated debt, impairments, leadership changes, and more), with **real extracted content from each filing's actual document** (not just item-code labels) and **clustering detection** across filings (e.g. multiple leadership departures in a short window)
 2. **`analyze_insider_activity`** — risk analysis of a company's recent Form 4 insider transactions (clustered insider selling, officer/director activity, open-market conviction signal)
 
 Both tools live in **one server**, are **risk-focused by default** but support a neutral `mode="summary"` for plain filing lookups, are backed by a **3-day Upstash Redis cache**, and are built to handle **many concurrent callers** (designed for a single hosted deployment used by multiple paying clients, e.g. via Render).
@@ -12,7 +12,7 @@ Both tools live in **one server**, are **risk-focused by default** but support a
 ## How it works
 
 - **Data source:** SEC EDGAR (`data.sec.gov` / `www.sec.gov`), free, no API key. Tickers are resolved to CIK numbers via SEC's official ticker map.
-- **8-K analysis:** Pulls the company's filing history, filters to Form 8-K / 8-K-A, and classifies each filing's official "item codes" (e.g. `4.02` = restatement, `1.03` = bankruptcy) against a built-in risk taxonomy (`core/risk_rules.py`).
+- **8-K analysis:** Pulls the company's filing history, filters to Form 8-K / 8-K-A, and classifies each filing's official "item codes" (e.g. `4.02` = restatement, `1.03` = bankruptcy) against a built-in risk taxonomy (`core/risk_rules.py`). Beyond item codes, it fetches each filing's actual document and extracts real, verbatim text — every filing gets a short `details` excerpt per disclosed item, and the highest-priority flagged filings additionally get the complete section text. It also detects **clustering patterns** across filings (e.g. 3 leadership departures in 30 days), which surface as an explicit, explainable risk reason instead of staying invisible inside a flat score.
 - **Insider activity analysis:** Pulls the company's recent Form 4 filings, downloads and parses the actual ownership XML for each one (not just metadata), and classifies transaction codes (P/S/A/M/F/etc.) to detect clustered open-market selling vs. routine compensation-driven activity (grants, option exercises, tax withholding).
 - **Caching:** Every tool call checks Redis *first*. On a hit, the cached result is returned immediately with no SEC EDGAR calls at all. On a miss, the tool does the real work, then writes the result to cache with a 3-day TTL. Cache keys are built deterministically from the tool name + normalized parameters (ticker is case/whitespace-insensitive), so `"aapl"` and `"AAPL "` hit the same cache entry. **Errors are never cached** — a transient SEC EDGAR hiccup won't poison the cache for 3 days.
 - **Concurrency:** The server runs on the `streamable-http` MCP transport in stateless mode — designed for one deployed URL serving many simultaneous clients, not a single local desktop session. SEC EDGAR calls are rate-limited process-wide (max 8 req/sec, under SEC's 10/sec ceiling) so concurrent requests from different users can't collectively get the server's IP blocked.
@@ -25,9 +25,10 @@ Both tools live in **one server**, are **risk-focused by default** but support a
 risklens-mcp/
 ├── core/
 │   ├── __init__.py
-│   ├── cache.py          # Upstash Redis caching layer (3-day TTL)
-│   ├── sec_client.py      # Shared SEC EDGAR HTTP client (rate-limited)
-│   └── risk_rules.py      # Shared 8-K item code / Form 4 transaction code risk taxonomy
+│   ├── cache.py            # Upstash Redis caching layer (3-day TTL)
+│   ├── sec_client.py       # Shared SEC EDGAR HTTP client (rate-limited)
+│   ├── filing_content.py   # Real filing document fetch + HTML→text + per-item section extraction
+│   └── risk_rules.py       # Shared risk taxonomy: item codes, transaction codes, clustering rules
 ├── tools/
 │   ├── __init__.py
 │   ├── eight_k_events.py      # analyze_8k_events tool
@@ -48,9 +49,10 @@ risklens-mcp/
 |---|---|---|---|
 | `ticker` | string | — | Required. e.g. `"AAPL"`. Case-insensitive. |
 | `lookback_days` | int | `180` | Clamped to `[1, 1825]` (5 years). |
-| `mode` | `"risk"` \| `"summary"` | `"risk"` | `"risk"` = scored risk analysis. `"summary"` = neutral filing list. |
+| `mode` | `"risk"` \| `"summary"` | `"risk"` | `"risk"` = scored risk analysis. `"summary"` = neutral filing list. Both include real per-filing `details`. |
+| `include_excerpts` | bool | `true` | When true, fetches each filing's actual document for real extracted content. Set `false` for a faster, metadata-only response (item codes/labels only, no real filing text). |
 
-Returns (risk mode): `risk_score` (0–10), `risk_level` (LOW/MODERATE/ELEVATED/SEVERE), `flagged_filings`, `risk_category_breakdown`, a plain-language `narrative`, and a `disclaimer`. Always includes `from_cache: bool`.
+Returns (risk mode): `risk_score` (0–10), `risk_level` (LOW/MODERATE/ELEVATED/SEVERE), `risk_reason` (a concrete, human-readable explanation — not just a label), `clusters_detected`, `flagged_filings`, `flagged_filings_full_text` (complete document text for the highest-priority flagged filings), `all_filings` (every filing, each with a `details` field of real extracted excerpts per item), `risk_category_breakdown`, a plain-language `narrative`, and a `disclaimer`. Always includes `from_cache: bool`.
 
 ### `analyze_insider_activity`
 
