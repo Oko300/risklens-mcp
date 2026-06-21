@@ -108,6 +108,11 @@ async def _run_analysis(ticker: str, lookback_days: int, mode: str, max_filings:
 
     form4_filings_meta = _extract_form4_filing_refs(submissions, lookback_days, max_filings)
 
+    logger.info(
+        "DIAG: cik=%s ticker=%s lookback_days=%d -> found %d Form 4 filing ref(s) in window",
+        cik, ticker, lookback_days, len(form4_filings_meta),
+    )
+
     if not form4_filings_meta:
         empty = _empty_result(ticker, company, cik, lookback_days, mode)
         return empty
@@ -181,20 +186,36 @@ async def _fetch_and_parse_form4(cik: str, ref: dict[str, Any]) -> list[dict[str
     """
     accession_number = ref.get("accession_number")
     if not accession_number:
+        logger.warning("DIAG: ref has no accession_number: %r", ref)
         return []
 
     xml_filename = await _find_form4_xml_filename(cik, accession_number, ref.get("primary_document"))
     if not xml_filename:
+        logger.warning(
+            "DIAG: no xml_filename resolved for cik=%s accession=%s primary_document=%r",
+            cik, accession_number, ref.get("primary_document"),
+        )
         return []
+
+    logger.info("DIAG: resolved xml_filename=%r for accession=%s", xml_filename, accession_number)
 
     xml_text = await fetch_document_text(cik, accession_number, xml_filename)
     if not xml_text:
+        logger.warning(
+            "DIAG: fetch_document_text returned empty for cik=%s accession=%s filename=%s",
+            cik, accession_number, xml_filename,
+        )
         return []
 
+    logger.info("DIAG: fetched %d chars of XML/text for accession=%s", len(xml_text), accession_number)
+
     try:
-        return _parse_form4_xml(xml_text, filing_date=ref["filing_date"], accession_number=accession_number, cik=cik)
-    except ET.ParseError:
-        logger.warning("Form 4 XML parse error for accession %s", accession_number)
+        parsed = _parse_form4_xml(xml_text, filing_date=ref["filing_date"], accession_number=accession_number, cik=cik)
+        logger.info("DIAG: parsed %d transaction(s) from accession=%s", len(parsed), accession_number)
+        return parsed
+    except ET.ParseError as e:
+        logger.warning("Form 4 XML parse error for accession %s: %s", accession_number, e)
+        logger.warning("DIAG: first 500 chars of unparseable content: %r", xml_text[:500])
         return []
 
 
