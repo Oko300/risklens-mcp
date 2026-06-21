@@ -219,13 +219,34 @@ async def _fetch_and_parse_form4(cik: str, ref: dict[str, Any]) -> list[dict[str
         return []
 
 
+def _is_real_ownership_xml(name: str) -> bool:
+    """
+    True if `name` looks like the genuine machine-readable ownershipDocument
+    XML (not the SEC's xslF345X0*-rendered HTML-with-.xml-extension display
+    copy, which lives in a path like 'xslF345X05/<file>.xml' and will fail
+    XML parsing because it actually contains an HTML <!DOCTYPE html> document).
+    """
+    lowered = name.lower()
+    if not lowered.endswith(".xml"):
+        return False
+    if "xslf345" in lowered:
+        return False
+    return True
+
+
 async def _find_form4_xml_filename(cik: str, accession_number: str, primary_document: Optional[str]) -> Optional[str]:
     """
-    Determine the actual ownership XML filename inside a Form 4 filing folder.
-    Most filings' primaryDocument IS the XML (or an xslt-rendered view of it);
-    fall back to the filing's index.json if needed.
+    Determine the actual machine-readable ownership XML filename inside a
+    Form 4 filing folder.
+
+    IMPORTANT: EDGAR's submissions JSON often reports `primaryDocument` as
+    the *rendered* copy, e.g. "xslF345X05/wk-form4_123.xml" — despite the
+    .xml extension, that file is HTML (SEC's XSL-stylesheet-rendered display
+    version), not parseable as XML. We must skip anything under an
+    xslF345X0*/ folder and use the real top-level XML data file instead,
+    which is always discoverable via the filing's index.json.
     """
-    if primary_document and primary_document.lower().endswith(".xml"):
+    if primary_document and _is_real_ownership_xml(primary_document):
         return primary_document
 
     index = await fetch_filing_index_json(cik, accession_number)
@@ -233,13 +254,16 @@ async def _find_form4_xml_filename(cik: str, accession_number: str, primary_docu
         return None
 
     items = index.get("directory", {}).get("item", [])
+
+    # Prefer a file whose name signals it's the ownership document.
     for item in items:
         name = item.get("name", "")
-        if name.lower().endswith(".xml") and "ownership" in name.lower():
+        if _is_real_ownership_xml(name) and "ownership" in name.lower():
             return name
+    # Otherwise take any genuine (non-rendered) .xml file in the filing root.
     for item in items:
         name = item.get("name", "")
-        if name.lower().endswith(".xml"):
+        if _is_real_ownership_xml(name):
             return name
     return None
 
@@ -273,9 +297,20 @@ def _parse_form4_xml(xml_text: str, filing_date: str, accession_number: str, cik
     Parse an ownershipDocument XML into a flat list of transaction dicts.
     Handles both non-derivative and derivative transactions.
     """
+    cleaned = xml_text.strip()
+
+    # Defensive guard: SEC's xslF345X0*-rendered "display" files keep a
+    # .xml extension but actually contain HTML. If one slips through despite
+    # _is_real_ownership_xml filtering it out upstream, fail clearly instead
+    # of with an opaque XML syntax error.
+    if cleaned[:15].lower().startswith("<!doctype html") or "<html" in cleaned[:200].lower():
+        raise ET.ParseError(
+            f"Received HTML (rendered display copy) instead of raw ownershipDocument XML "
+            f"for accession {accession_number} — this file should have been excluded upstream."
+        )
+
     # Strip XML declaration weirdness / leading whitespace that sometimes
     # precedes the root element in EDGAR-served files.
-    cleaned = xml_text.strip()
     match = re.search(r"<ownershipDocument[\s\S]*</ownershipDocument>", cleaned)
     if match:
         cleaned = match.group(0)
