@@ -129,7 +129,88 @@ def score_to_risk_level(score: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Clustering detection — context-aware risk signals that a single item code
+# Content-based severity scoring
+# ---------------------------------------------------------------------------
+# Item codes where the *base* weight from item code alone is insufficient —
+# e.g. 5.02 covers everything from "junior VP retires" to "CEO stepping down",
+# and those are not remotely equivalent in risk. For these codes, we scan the
+# already-extracted filing text (which we now have via filing_content.py) for
+# role-level keywords to determine the actual severity.
+#
+# This runs on text we already fetched — no extra API calls, no latency hit.
+# ---------------------------------------------------------------------------
+
+import re as _re  # noqa: E402
+
+# Roles that, when detected as the departing/appointed person's title in a
+# 5.02 filing, indicate a genuinely high-significance leadership event.
+# Ordered from most to least significant so we can report the highest match.
+_C_SUITE_TITLES: list[tuple[str, int]] = [
+    # (display_label, escalated_weight)
+    ("Chief Executive Officer", 3),
+    ("CEO", 3),
+    ("President and Chief Executive", 3),
+    ("Chief Financial Officer", 2),
+    ("CFO", 2),
+    ("Chief Operating Officer", 2),
+    ("COO", 2),
+    ("Executive Chairman", 2),
+    ("Executive Chair", 2),
+    ("President", 2),
+    ("Chief Technology Officer", 2),
+    ("CTO", 2),
+    ("Chief Revenue Officer", 2),
+    ("Chief Legal Officer", 2),
+    ("General Counsel", 2),
+]
+
+# Build a single compiled regex for fast matching.
+# \b word boundaries are CRITICAL — without them, "COO" matches inside "Cook",
+# "CTO" matches inside "director", and so on.
+_C_SUITE_PATTERN = _re.compile(
+    r"\b(?:" + "|".join(_re.escape(title) for title, _ in _C_SUITE_TITLES) + r")\b",
+    _re.IGNORECASE,
+)
+
+# Map title -> escalated_weight for fast lookup after a regex match
+_TITLE_TO_WEIGHT: dict[str, int] = {title.lower(): w for title, w in _C_SUITE_TITLES}
+
+
+def score_5_02_from_text(text: str) -> dict[str, object]:
+    """
+    Given the extracted text of a 5.02 filing section, return a content-aware
+    severity assessment:
+        {
+            "escalated_weight": int,      # upgraded weight (1-3)
+            "detected_title": str | None, # the specific role that triggered escalation
+            "content_risk_label": str,    # human-readable reason
+        }
+
+    Returns base weight=1 with no detected title if no high-significance
+    title is found — safe fallback, no false positives.
+    """
+    if not text:
+        return {"escalated_weight": 1, "detected_title": None, "content_risk_label": "Officer/director change — role significance unknown"}
+
+    match = _C_SUITE_PATTERN.search(text)
+    if not match:
+        return {"escalated_weight": 1, "detected_title": None, "content_risk_label": "Officer/director change — role not identified as C-suite"}
+
+    matched_title = match.group(0)
+    escalated = _TITLE_TO_WEIGHT.get(matched_title.lower(), 1)
+    label = f"{'CEO' if escalated == 3 else 'Senior executive'} transition — {matched_title} named in filing"
+    return {
+        "escalated_weight": escalated,
+        "detected_title": matched_title,
+        "content_risk_label": label,
+    }
+
+
+# Item codes where content-based scoring applies (currently just 5.02,
+# but structured so other codes can be added in future without touching
+# the calling code in eight_k_events.py).
+CONTENT_SCORED_ITEMS = {"5.02"}
+
 # can't capture on its own. A single 5.02 (officer departure) is routine;
 # three of them in 60 days is a pattern worth flagging explicitly, with the
 # reason stated plainly rather than buried in a generic risk_score.

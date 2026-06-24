@@ -43,12 +43,14 @@ from typing import Any, Literal, Optional
 from core.cache import build_cache_key, get_cached, set_cached
 from core.filing_content import build_excerpt, fetch_item_sections
 from core.risk_rules import (
+    CONTENT_SCORED_ITEMS,
     EIGHT_K_ITEMS,
     HIGH_RISK_8K_ITEMS,
     SEVERE_RISK_8K_ITEMS,
     classify_8k_item,
     detect_clusters,
     risk_tier_with_reason,
+    score_5_02_from_text,
     score_to_risk_level,
 )
 from core.sec_client import fetch_submissions, resolve_ticker_to_cik
@@ -275,13 +277,57 @@ async def _build_risk_response(
 ) -> dict[str, Any]:
     company_name = company.get("name") or ticker
 
-    all_item_hits: list[dict[str, Any]] = []
-    for f in filings:
-        for detail in f["items_detail"]:
-            all_item_hits.append({**detail, "filing_date": f["filing_date"], "filing_url": f["filing_url"]})
+    # --- Step 1: Fetch content for ALL filings first (bounded) so we can
+    # use real filing text to upgrade item weights BEFORE scoring.
+    # This is the key fix: content-based severity detection needs the text
+    # before we decide what's flagged, not after.
+    if include_excerpts:
+        detail_targets = filings[:MAX_FILINGS_FOR_DETAILS]
+        section_results = await asyncio.gather(
+            *[
+                fetch_item_sections(cik, f["accession_number"], f.get("primary_document"))
+                for f in detail_targets
+            ],
+            return_exceptions=True,
+        )
+        filing_content_by_accession: dict[str, dict[str, str]] = {}
+        for f, sections in zip(detail_targets, section_results):
+            if isinstance(sections, Exception):
+                logger.warning("Content fetch failed for accession=%s: %s", f.get("accession_number"), sections)
+                sections = {}
+            filing_content_by_accession[f["accession_number"]] = sections
+    else:
+        filing_content_by_accession = {}
 
-    high_risk_hits = [h for h in all_item_hits if h["code"] in HIGH_RISK_8K_ITEMS]
-    severe_hits = [h for h in all_item_hits if h["code"] in SEVERE_RISK_8K_ITEMS]
+    # --- Step 2: Build item hits, applying content-based weight upgrades
+    # for items in CONTENT_SCORED_ITEMS (currently 5.02). Every 5.02 item
+    # now gets its text scanned for role keywords (CEO, CFO, COO, President,
+    # Chairman, etc.) so a CEO transition scores very differently from a
+    # routine accounting-officer change — even though both are "Item 5.02".
+    all_item_hits: list[dict[str, Any]] = []
+    content_signals: dict[str, dict[str, Any]] = {}  # accession -> content signal
+
+    for f in filings:
+        sections = filing_content_by_accession.get(f["accession_number"], {})
+        for detail in f["items_detail"]:
+            item_entry = {**detail, "filing_date": f["filing_date"], "filing_url": f["filing_url"]}
+
+            if detail["code"] in CONTENT_SCORED_ITEMS and sections.get(detail["code"]):
+                signal = score_5_02_from_text(sections[detail["code"]])
+                if signal["escalated_weight"] > int(detail["weight"]):
+                    item_entry = {
+                        **item_entry,
+                        "weight": signal["escalated_weight"],
+                        "content_risk_label": signal["content_risk_label"],
+                        "detected_title": signal["detected_title"],
+                    }
+                    content_signals[f["accession_number"]] = signal
+
+            all_item_hits.append(item_entry)
+
+    # --- Step 3: Compute risk score from (possibly upgraded) weights
+    high_risk_hits = [h for h in all_item_hits if int(h["weight"]) >= 2]
+    severe_hits = [h for h in all_item_hits if int(h["weight"]) >= 3]
 
     weight_to_floor = {3: 7.5, 2: 5.0, 1: 2.0, 0: 0.0}
     max_weight = max((int(h["weight"]) for h in all_item_hits), default=0)
@@ -296,52 +342,40 @@ async def _build_risk_response(
     normalized_score = min(10.0, base_score + cluster_bump)
     risk_level = score_to_risk_level(normalized_score)
 
-    severe_labels = sorted({h["label"] for h in severe_hits})
+    # Build risk reason — prefer content-detected signals over generic ones
+    # so "CEO transition — Chief Executive Officer named in filing" is the
+    # reason rather than a bare "elevated-risk disclosure category present".
+    content_reason = None
+    if content_signals:
+        # pick the highest-weight content signal to lead the reason
+        best_signal = max(content_signals.values(), key=lambda s: s["escalated_weight"])
+        if best_signal["escalated_weight"] >= 2:
+            content_reason = best_signal["content_risk_label"]
+
+    severe_labels = sorted({h.get("content_risk_label") or h["label"] for h in severe_hits})
     cluster_reasons = [c["reason"] for c in clusters]
-    tier = risk_tier_with_reason(normalized_score, cluster_reasons, severe_labels)
+    tier = risk_tier_with_reason(
+        normalized_score,
+        cluster_reasons,
+        severe_labels if severe_labels else ([content_reason] if content_reason else []),
+    )
 
     category_counts: dict[str, int] = {}
     for h in all_item_hits:
         category_counts[h["category"]] = category_counts.get(h["category"], 0) + 1
 
+    # Flagged filings: weight >= 2 (now includes content-upgraded items),
+    # OR part of a detected cluster, OR has a content signal (CEO/CFO/etc.)
     flagged_filings = [
         f
         for f in filings
-        if any(d["weight"] >= 2 for d in f["items_detail"])
+        if any(int(d["weight"]) >= 2 for d in f["items_detail"])
         or any(f["filing_date"] in c.get("matched_dates", []) for c in clusters)
+        or f["accession_number"] in content_signals
     ]
 
-    # Two-tier content fetch:
-    #   1. DETAILS: every filing (up to MAX_FILINGS_FOR_DETAILS) gets a short,
-    #      real excerpt pulled from its actual document text — not just the
-    #      item-code label — so the reader sees what happened before the
-    #      risk read, per the product's "filings with detail first, risk
-    #      layered on top" design.
-    #   2. FULL TEXT: only flagged/high-risk filings (or those caught in a
-    #      detected cluster) additionally get the complete per-item section
-    #      text, since that's where deeper read is actually worth the extra
-    #      fetch — routine filings stay fast.
-    if include_excerpts:
-        detail_targets = filings[:MAX_FILINGS_FOR_DETAILS]
-        full_text_accessions = {f["accession_number"] for f in flagged_filings[:MAX_FILINGS_FOR_FULL_TEXT]}
-
-        section_results = await asyncio.gather(
-            *[
-                fetch_item_sections(cik, f["accession_number"], f.get("primary_document"))
-                for f in detail_targets
-            ],
-            return_exceptions=True,
-        )
-
-        filing_content_by_accession: dict[str, dict[str, str]] = {}
-        for f, sections in zip(detail_targets, section_results):
-            if isinstance(sections, Exception):
-                logger.warning("Content fetch failed for accession=%s: %s", f.get("accession_number"), sections)
-                sections = {}
-            filing_content_by_accession[f["accession_number"]] = sections
-    else:
-        filing_content_by_accession = {}
-        full_text_accessions = set()
+    # --- Step 4: Full text for flagged filings only
+    full_text_accessions = {f["accession_number"] for f in flagged_filings[:MAX_FILINGS_FOR_FULL_TEXT]}
 
     def _filing_details(f: dict[str, Any]) -> dict[str, Any]:
         sections = filing_content_by_accession.get(f["accession_number"], {})
@@ -351,10 +385,17 @@ async def _build_risk_response(
             if f["accession_number"] in full_text_accessions
             else {}
         )
+        # Attach content signal if present so the output explicitly says what
+        # role was detected (e.g. "detected_title: Chief Executive Officer")
+        signal = content_signals.get(f["accession_number"])
         return {
-            "item_excerpts": item_excerpts,  # short, ~110-word excerpt per disclosed item, real text from the filing
-            "item_full_text": full_text,  # complete section text, only populated for flagged filings
+            "item_excerpts": item_excerpts,
+            "item_full_text": full_text,
             "content_available": bool(sections),
+            "content_signal": {
+                "detected_title": signal["detected_title"],
+                "risk_label": signal["content_risk_label"],
+            } if signal else None,
         }
 
     excerpted_filings: list[dict[str, Any]] = []
@@ -368,13 +409,16 @@ async def _build_risk_response(
                     "item_labels": [d["label"] for d in f["items_detail"]],
                     "filing_url": f["filing_url"],
                     "item_full_text": details["item_full_text"],
+                    "content_signal": details["content_signal"],
                     "content_available": details["content_available"],
                 }
             )
 
     narrative = _risk_narrative(
-        company_name, lookback_days, filings, severe_hits, high_risk_hits, clusters, tier
+        company_name, lookback_days, filings, severe_hits, high_risk_hits, clusters, tier,
+        content_signals=content_signals,
     )
+
 
     return {
         "error": False,
@@ -395,9 +439,13 @@ async def _build_risk_response(
         "flagged_filings": [
             {
                 "filing_date": f["filing_date"],
-                "items": [d["code"] for d in f["items_detail"] if d["weight"] >= 2],
-                "item_labels": [d["label"] for d in f["items_detail"] if d["weight"] >= 2],
+                "items": f["item_codes"],
+                "item_labels": [d["label"] for d in f["items_detail"]],
                 "filing_url": f["filing_url"],
+                "content_signal": content_signals.get(f["accession_number"]) and {
+                    "detected_title": content_signals[f["accession_number"]]["detected_title"],
+                    "risk_label": content_signals[f["accession_number"]]["content_risk_label"],
+                },
             }
             for f in flagged_filings
         ],
@@ -431,6 +479,7 @@ def _risk_narrative(
     high_risk_hits: list[dict[str, Any]],
     clusters: list[dict[str, Any]],
     tier: dict[str, str],
+    content_signals: Optional[dict[str, Any]] = None,
 ) -> str:
     if not filings:
         return (
@@ -440,16 +489,42 @@ def _risk_narrative(
 
     parts = [f"{company_name}'s 8-K filings over the last {lookback_days} days: {tier['tier_label']}."]
 
+    # Content signals take priority in the narrative — these are real,
+    # specific events detected in the actual filing text (e.g. CEO departure),
+    # not just generic item-code labels. Naming what happened specifically
+    # is far more useful than "elevated-risk disclosure category present".
+    if content_signals:
+        best = max(content_signals.values(), key=lambda s: s["escalated_weight"])
+        if best["detected_title"]:
+            parts.append(
+                f"Content analysis of the actual filing text identified a significant leadership "
+                f"event: {best['content_risk_label']}. This type of disclosure is conventionally "
+                f"considered material by investors regardless of whether it appears with other "
+                f"risk signals in the same window."
+            )
+
     if severe_hits:
-        labels = sorted({h["label"] for h in severe_hits})
-        parts.append(
-            f"{len(severe_hits)} severe-category disclosure(s) found, including: "
-            f"{'; '.join(labels[:4])}. These categories are the ones SEC filers use for events "
-            "like restatements, bankruptcy, delisting, or accelerated debt obligations — worth "
-            "direct follow-up via the filing text itself."
-        )
-    elif high_risk_hits:
-        labels = sorted({h["label"] for h in high_risk_hits})
+        # Only add a separate "severe disclosures" sentence if it adds
+        # information beyond what the content signal already said.
+        non_content_severe = [h for h in severe_hits if not h.get("content_risk_label")]
+        if non_content_severe:
+            labels = sorted({h["label"] for h in non_content_severe})
+            parts.append(
+                f"{len(non_content_severe)} severe-category disclosure(s) found, including: "
+                f"{'; '.join(labels[:4])}. These categories are the ones SEC filers use for events "
+                "like restatements, bankruptcy, delisting, or accelerated debt obligations — worth "
+                "direct follow-up via the filing text itself."
+            )
+        elif not content_signals:
+            labels = sorted({h.get("content_risk_label") or h["label"] for h in severe_hits})
+            parts.append(
+                f"{len(severe_hits)} severe-category disclosure(s) found, including: "
+                f"{'; '.join(labels[:4])}. These categories are the ones SEC filers use for events "
+                "like restatements, bankruptcy, delisting, or accelerated debt obligations — worth "
+                "direct follow-up via the filing text itself."
+            )
+    elif high_risk_hits and not content_signals:
+        labels = sorted({h.get("content_risk_label") or h["label"] for h in high_risk_hits})
         parts.append(
             f"{len(high_risk_hits)} elevated-risk disclosure(s): {'; '.join(labels[:4])}. "
             "No severe-category items (e.g. bankruptcy, restatement, delisting) were found "
@@ -459,7 +534,7 @@ def _risk_narrative(
     if clusters:
         for c in clusters[:3]:
             parts.append(f"Pattern detected: {c['reason']}.")
-    elif not severe_hits and not high_risk_hits:
+    elif not severe_hits and not high_risk_hits and not content_signals:
         parts.append(
             f"All {len(filings)} filing(s) fall into routine or low-risk categories "
             "(e.g. earnings releases, exhibits, governance housekeeping), and no clustering "
